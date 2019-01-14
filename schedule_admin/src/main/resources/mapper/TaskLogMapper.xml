@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8" ?>
+<!DOCTYPE mapper PUBLIC "-//mybatis.org//DTD Mapper 3.0//EN" "http://mybatis.org/dtd/mybatis-3-mapper.dtd">
+<mapper namespace="com.wf.schedule.admin.mapper.TaskLogMapper">
+    <resultMap id="taskLogPo" type="com.wf.schedule.admin.po.TaskLogPo">
+        <id property="id" column="n_id" />
+        <result property="groupName" column="s_group_name"/>
+        <result property="jobName" column="s_job_name"/>
+        <result property="currentNodeId" column="s_current_node_id"/>
+
+        <result property="errorMsg" column="s_error_msg"/>
+        <result property="lastFireTime" column="d_last_fire_time" javaType="java.util.Date"/>
+        <result property="lastEndTime" column="d_last_end_time" javaType="java.util.Date"/>
+        <result property="success" column="n_success"/>
+    </resultMap>
+
+    <select id="listTaskLog" parameterType="Map" resultMap="taskLogPo">
+        SELECT * FROM schedule_task_log
+        WHERE s_group_name = '${groupName}' AND s_job_name = '${jobName}' ORDER  BY n_id DESC
+        limit #{start}, #{limit}
+    </select>
+
+    <insert id="saveTaskLog" parameterType="com.wf.schedule.admin.po.TaskLogPo" useGeneratedKeys="true" keyProperty="id">
+        INSERT INTO schedule_task_log (s_group_name, s_job_name,s_current_node_id,s_error_msg, d_last_fire_time, d_last_end_time, n_success)
+        VALUES (#{groupName}, #{jobName}, #{currentNodeId}, #{errorMsg}, #{lastFireTime},
+        #{lastEndTime}, #{success})
+    </insert>
+    
+    <delete id="deleteTaskResultList">
+        DELETE  FROM schedule_task_log WHERE s_group_name = '${groupName}' AND s_job_name = '${jobName}'
+    </delete>
+</mapper>

@@ -1,0 +1,576 @@
+/**
+ * 
+ */
+package com.wf.schedule.register;
+
+import com.wf.schedule.common.context.ZkConstant;
+import com.wf.schedule.common.spring.InstanceFactory;
+import com.wf.schedule.common.util.GfJsonUtil;
+import com.wf.schedule.core.AbstractJob;
+import com.wf.schedule.core.context.JobContext;
+import com.wf.schedule.core.SchedulerFactoryBeanWrapper;
+import com.wf.schedule.log.LogExceptionStackTrace;
+import com.wf.schedule.model.JobConfig;
+import com.wf.schedule.monitor.MonitorCommond;
+import com.wf.schedule.register.base.JobRegistry;
+import org.I0Itec.zkclient.IZkChildListener;
+import org.I0Itec.zkclient.IZkDataListener;
+import org.I0Itec.zkclient.IZkStateListener;
+import org.I0Itec.zkclient.ZkClient;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.commons.lang3.builder.ToStringBuilder;
+import org.apache.commons.lang3.builder.ToStringStyle;
+import org.apache.zookeeper.Watcher;
+import org.apache.zookeeper.data.Stat;
+import org.quartz.CronExpression;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.DisposableBean;
+import org.springframework.beans.factory.InitializingBean;
+import org.springframework.scheduling.quartz.SchedulerFactoryBean;
+
+import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+
+public class ZkJobRegistry implements JobRegistry,InitializingBean,DisposableBean {
+	
+	private static final Logger logger = LoggerFactory.getLogger(ZkJobRegistry.class);
+	
+	private Map<String, JobConfig> schedulerConfgs = new ConcurrentHashMap<>();
+
+
+	private ZkClient zkClient;
+	
+	private String groupPath;
+	
+	private String nodeStateParentPath;
+	
+	private ScheduledExecutorService zkCheckTask;
+	
+	private volatile boolean zkAvailabled = true;
+	
+	private volatile boolean updatingStatus;
+	
+	private boolean nodeEventSubscribed = false;
+
+
+	public void setZkClient(ZkClient zkClient) {
+		this.zkClient = zkClient;
+	}
+
+	@Override
+	public void afterPropertiesSet() throws Exception {
+       zkCheckTask = Executors.newScheduledThreadPool(1);
+       
+		zkCheckTask.scheduleAtFixedRate(new Runnable() {
+			@Override
+			public void run() {
+				if (schedulerConfgs.isEmpty()) {
+					return;
+				}
+				List<String> activeNodes = null;
+				try {
+					activeNodes = zkClient.getChildren(nodeStateParentPath);
+					zkAvailabled = true;
+				} catch (Exception e) {
+					checkZkAvailabled();
+					activeNodes = new ArrayList<>(JobContext.getContext().getActiveNodes());
+				}
+				
+				if(!activeNodes.contains(JobContext.getContext().getNodeId())){
+					zkClient.createEphemeral(String.format("%s/%s", nodeStateParentPath, JobContext.getContext().getNodeId()));
+					logger.info("node[{}] re-join task clusters",JobContext.getContext().getNodeId());
+				}
+				//对节点列表排序
+				Collections.sort(activeNodes);
+				//本地缓存的所有jobs
+				Collection<JobConfig> jobConfigs = schedulerConfgs.values();
+				//
+				for (JobConfig jobConfig : jobConfigs) {						
+					// 如果本地任务指定的执行节点不在当前实际的节点列表，重新指定
+					if (!activeNodes.contains(jobConfig.getCurrentNodeId())) {
+						//指定当前节点为排序后的第一个节点
+						String newExecuteNodeId = activeNodes.get(0);
+						jobConfig.setCurrentNodeId(newExecuteNodeId);
+						logger.warn("Job[{}-{}] currentNodeId[{}] not in activeNodeList, assign new ExecuteNodeId:{}",jobConfig.getGroupName(),jobConfig.getJobName(),jobConfig.getCurrentNodeId(),newExecuteNodeId);
+					}
+				}
+			}
+		}, 60, 30, TimeUnit.SECONDS);
+	}
+
+	public void subcribeState () {
+		zkClient.subscribeStateChanges(new IZkStateListener() {
+			@Override
+			public void handleStateChanged(Watcher.Event.KeeperState keeperState) throws Exception {
+				logger.info("zk state changed:{}", keeperState.getIntValue());
+				if (keeperState.getIntValue() == Watcher.Event.KeeperState.Disconnected.getIntValue()) {
+					SchedulerFactoryBean schedulerFactoryBean = InstanceFactory.getInstance(SchedulerFactoryBean.class);
+					schedulerFactoryBean.destroy();
+					zkClient.unsubscribeAll();
+					zkCheckTask.shutdown();
+					zkClient.close();
+				}
+			}
+
+			@Override
+			public void handleNewSession() throws Exception {
+				logger.info("zk new session created");
+			}
+
+			@Override
+			public void handleSessionEstablishmentError(Throwable throwable) throws Exception {
+				logger.error("zk session establish error:{}",throwable.getMessage());
+			}
+		});
+	}
+
+	@Override
+	public void createGroup(String groupName) {
+		if (groupPath == null) {
+			groupPath = String.format("%s%s", ZkConstant.ROOT_NODE, groupName);
+		}
+		if (!zkClient.exists(groupPath)) {
+			zkClient.createPersistent(groupPath, true);
+		}
+	}
+
+	@Override
+	public void registerGroup(String groupName) {
+		if(groupPath == null){
+			groupPath = String.format("%s%s", ZkConstant.ROOT_NODE, groupName);
+		}
+		String nodePath = String.format("%s%s/%s", ZkConstant.ROOT_NODE, groupName, ZkConstant.SERVER_NODES);
+		if(!zkClient.exists(nodePath)){
+			zkClient.createPersistent(nodePath);
+		}
+		zkClient.subscribeChildChanges(groupPath, new IZkChildListener() {
+			@Override
+			public void handleChildChange(String parentPath, List<String> currentChilds) throws Exception {
+				currentChilds.forEach(jobName->{
+					if ( !jobName.equals(ZkConstant.SERVER_NODES)
+							&& !schedulerConfgs.containsKey(jobName)) {
+						SchedulerFactoryBeanWrapper schedulerFactoryBeanWrapper = InstanceFactory.getInstance(SchedulerFactoryBeanWrapper.class);
+						try {
+							schedulerFactoryBeanWrapper.afterPropertiesSet();
+						} catch (Exception e) {
+							logger.error("group node subscribe error:{}", e);
+						}
+						/** 装载新任务 END**/
+					}
+				});
+			}
+		});
+	}
+
+	/**
+	 * 注册任务节点
+	 * @param conf
+	 */
+	@Override
+	public synchronized void register(JobConfig conf) {	
+		//是否第一个启动节点
+		boolean isFirstNode = false;
+
+		if (conf.getJobName() != null) { //不添加空任务
+			Calendar now = Calendar.getInstance();
+			long currentTimeMillis = now.getTimeInMillis();
+			conf.setModifyTime(currentTimeMillis);
+
+			if(groupPath == null){
+				groupPath = String.format("%s%s", ZkConstant.ROOT_NODE, conf.getGroupName());
+			}
+			if(nodeStateParentPath == null){
+				nodeStateParentPath = String.format("%s/%s", groupPath, ZkConstant.SERVER_NODES);
+			}
+
+			String path = getPath(conf);
+
+			final String jobName = conf.getJobName();
+			final String jobGroup = conf.getGroupName();
+
+			if(!zkClient.exists(nodeStateParentPath)){
+				isFirstNode = true;
+				zkClient.createPersistent(nodeStateParentPath, true);
+			}else{
+				//检查是否有节点
+				if(!isFirstNode){
+					isFirstNode = zkClient.getChildren(nodeStateParentPath).size() == 0;
+				}
+			}
+
+			if(!zkClient.exists(path)){
+				zkClient.createPersistent(path, true);
+			}
+
+			//是否要更新ZK的conf配置
+			boolean updateConfInZK = isFirstNode;
+			if(!updateConfInZK){
+				JobConfig configFromZK = getConfigFromZK(path,null);
+				if(configFromZK != null){
+					//1.当前执行时间策略变化了
+					//2.下一次执行时间在当前时间之前
+					//3.配置文件修改是30分钟前
+					if(!StringUtils.equals(configFromZK.getCronExpr(), conf.getCronExpr())){
+						updateConfInZK = true;
+					}else if(configFromZK.getNextFireTime() != null && configFromZK.getNextFireTime().before(now.getTime())){
+						updateConfInZK = true;
+					}else if(currentTimeMillis - configFromZK.getModifyTime() > TimeUnit.MINUTES.toMillis(30)){
+						updateConfInZK = true;
+					}else{
+						if(!JobContext.getContext().getNodeId().equals(configFromZK.getCurrentNodeId())){
+							List<String> nodes = zkClient.getChildren(nodeStateParentPath);
+							updateConfInZK = !nodes.contains(configFromZK.getCurrentNodeId());
+						}
+					}
+				}else{
+					//zookeeper 该job不存在？
+					updateConfInZK = true;
+				}
+				//拿ZK上的配置覆盖当前的
+				if(!updateConfInZK){
+					conf = configFromZK;
+				}
+			}
+
+			if(updateConfInZK){
+				conf.setCurrentNodeId(JobContext.getContext().getNodeId());
+				zkClient.writeData(path, GfJsonUtil.toJSONString(conf));
+			}
+			schedulerConfgs.put(conf.getJobName(), conf);
+
+			zkClient.subscribeChildChanges(groupPath, new IZkChildListener() {
+				@Override
+				public void handleChildChange(String parentPath, List<String> currentChilds) throws Exception {
+					/** 订阅子节点变更 **/
+					currentChilds.forEach(jobName->{
+						if ( !jobName.equals(ZkConstant.SERVER_NODES)
+								&& !schedulerConfgs.containsKey(jobName)) {
+							SchedulerFactoryBeanWrapper schedulerFactoryBeanWrapper = InstanceFactory.getInstance(SchedulerFactoryBeanWrapper.class);
+							try {
+								schedulerFactoryBeanWrapper.afterPropertiesSet();
+							} catch (Exception e) {
+								logger.error("[scheduler] watch group child node error:{}" , LogExceptionStackTrace.erroStackTrace(e));
+							}
+							/** 装载新任务 END**/
+						}
+					});
+
+				}
+			});
+
+			//订阅同步信息变化
+			zkClient.subscribeDataChanges(path, new IZkDataListener() {
+
+				@Override
+				public void handleDataDeleted(String dataPath) throws Exception {
+					/** 删除任务 **/
+					MonitorCommond monitorCommond = new MonitorCommond(MonitorCommond.TYPE_DELETE_MOD, jobGroup, jobName, null);
+					execCommond(monitorCommond);
+				}
+
+				@Override
+				public void handleDataChange(String dataPath, Object data) throws Exception {
+					if (data == null) {
+						return;
+					}
+					JobConfig _jobConfig = GfJsonUtil.parseObject(data.toString(), JobConfig.class);
+					if (schedulerConfgs.containsKey(_jobConfig.getJobName())) {
+						schedulerConfgs.put(_jobConfig.getJobName(), _jobConfig);
+					}
+				}
+			});
+
+			//
+			regAndSubscribeNodeEvent();
+
+			logger.info("finish register schConfig:{}", ToStringBuilder.reflectionToString(conf, ToStringStyle.MULTI_LINE_STYLE));
+		}
+		
+	}
+
+	/**
+	 * 订阅节点事件
+	 * @return
+	 */
+	private synchronized void regAndSubscribeNodeEvent() {
+		if(nodeEventSubscribed)return;
+		//创建node节点
+		String nodeIdPath = String.format("%s/%s", nodeStateParentPath, JobContext.getContext().getNodeId());
+		if (zkClient.exists(nodeIdPath)) {
+			zkClient.delete(nodeIdPath);
+		}
+		zkClient.createEphemeral(String.format("%s/%s", nodeStateParentPath, JobContext.getContext().getNodeId()));
+
+		String path;
+		//订阅节点信息变化
+        zkClient.subscribeChildChanges(nodeStateParentPath, new IZkChildListener() {
+			@Override
+			public void handleChildChange(String parentPath, List<String> currentChilds) throws Exception {
+				//
+				if(currentChilds == null || !currentChilds.contains(JobContext.getContext().getNodeId())){
+					zkClient.createEphemeral(String.format("%s/%s", nodeStateParentPath, JobContext.getContext().getNodeId()));
+					logger.info("Nodelist is empty~ node[{}] re-join task clusters",JobContext.getContext().getNodeId());
+					return;
+				}
+				logger.info(">>nodes changed ,nodes:{}",currentChilds);
+				//分配节点
+				rebalanceJobNode(currentChilds);
+				//刷新当前可用节点
+				JobContext.getContext().refreshNodes(currentChilds);
+			}
+		});
+        
+        logger.info("subscribe nodes change event at path:{}",nodeStateParentPath);
+
+        path = String.format("%s/%s", nodeStateParentPath, JobContext.getContext().getNodeId());
+        zkClient.subscribeDataChanges(path, new IZkDataListener() {
+			@Override
+			public void handleDataDeleted(String dataPath) throws Exception {}
+			@Override
+					public void handleDataChange(String dataPath, Object data) throws Exception {
+						logger.info("[schedule] listen command data", String.valueOf(data));
+						MonitorCommond cmd = GfJsonUtil.parseObject(String.valueOf(data), MonitorCommond.class);
+						if(cmd != null){
+							logger.info("[schedule] 收到commond:" + cmd.toString());
+					execCommond(cmd);
+				}
+			}
+		});
+
+        logger.info("subscribe command event at path:{}",path);
+        
+        
+        //刷新节点列表
+        List<String> activeNodes = zkClient.getChildren(nodeStateParentPath);
+		JobContext.getContext().refreshNodes(activeNodes);
+		
+		logger.info("current activeNodes:{}",activeNodes);
+		nodeEventSubscribed = true;
+	}
+	
+	/**
+	 * 重新分配执行节点
+	 * @param nodes
+	 */
+	private synchronized void rebalanceJobNode(List<String> nodes) {
+		while(updatingStatus);
+		Collection<JobConfig> jobs = schedulerConfgs.values();
+		int nodeIndex = 0;
+		for (JobConfig job : jobs) {
+			String nodeId = nodes.get(nodeIndex++);
+			if(!StringUtils.equals(job.getCurrentNodeId(), nodeId)){
+				job.setCurrentNodeId(nodeId);
+				logger.info("rebalance Job[{}-{}] To Node[{}] ",job.getGroupName(),job.getJobName(),nodeId);
+			}
+			if(nodeIndex >= nodes.size()){
+				nodeIndex = 0;
+			}
+			//
+			updateJobConfig(job);
+		}
+		
+	}
+
+	private synchronized JobConfig getConfigFromZK(String path,Stat stat){
+		Object data = stat == null ? zkClient.readData(path) : zkClient.readData(path,stat);
+		return data == null ? null : GfJsonUtil.parseObject(data.toString(), JobConfig.class);
+	}
+
+	@Override
+	public synchronized JobConfig getConf(String jobName,boolean forceRemote) {
+		JobConfig config = schedulerConfgs.get(jobName);
+		
+		if(forceRemote){	
+			//如果只有一个节点就不从强制同步了
+			if(JobContext.getContext().getActiveNodes().size() == 1){
+				config.setCurrentNodeId(JobContext.getContext().getNodeId());
+				return config;
+			}
+			String path = getPath(config);
+			try {				
+				config = getConfigFromZK(path,null);
+			} catch (Exception e) {
+				checkZkAvailabled();
+				logger.warn("fecth JobConfig from Registry error",e);
+			}
+		}
+		return config;
+	}
+	
+	@Override
+	public synchronized void unregister(String jobName) {
+		JobConfig config = schedulerConfgs.get(jobName);
+		
+		String path = getPath(config);
+		
+		if(zkClient.getChildren(nodeStateParentPath).size() == 1){
+			zkClient.delete(path);
+			logger.info("all node is closed ,delete path:"+path);
+		}
+	}
+	
+	private String getPath(JobConfig config){
+		return String.format("%s%s/%s", ZkConstant.ROOT_NODE, config.getGroupName(), config.getJobName());
+	}
+
+	@Override
+	public void destroy() throws Exception {
+		zkCheckTask.shutdown();
+		zkClient.close();
+	}
+
+	@Override
+	public void setRuning(String jobName, Date fireTime) {
+		updatingStatus = false;
+		try {			
+			JobConfig config = getConf(jobName,false);
+			config.setRunning(true);
+			config.setLastFireTime(fireTime);
+			config.setModifyTime(Calendar.getInstance().getTimeInMillis());
+			config.setErrorMsg(null);
+			//更新本地
+			schedulerConfgs.put(jobName, config);
+			try {			
+				if(zkAvailabled)zkClient.writeData(getPath(config), GfJsonUtil.toJSONString(config));
+			} catch (Exception e) {
+				checkZkAvailabled();
+				logger.warn(String.format("Job[{}] setRuning error...", jobName),e);
+			}
+		} finally {
+			updatingStatus = false;
+		}
+	}
+
+	@Override
+	public void setStoping(String jobName, Date nextFireTime,Exception e) {
+		updatingStatus = false;
+		try {
+			JobConfig config = getConf(jobName,false);
+			config.setRunning(false);
+			config.setNextFireTime(nextFireTime);
+			config.setModifyTime(Calendar.getInstance().getTimeInMillis());
+			config.setErrorMsg(e == null ? null : e.getMessage());
+			//更新本地
+			schedulerConfgs.put(jobName, config);
+			try {		
+				if(zkAvailabled)zkClient.writeData(getPath(config), GfJsonUtil.toJSONString(config));
+			} catch (Exception ex) {
+				checkZkAvailabled();
+				logger.warn(String.format("Job[{}] setStoping error...", jobName),ex);
+			}
+		} finally {
+			updatingStatus = false;
+		}
+		
+	}
+
+
+	@Override
+	public List<JobConfig> getAllJobs() {
+		return new ArrayList<>(schedulerConfgs.values());
+	}
+
+	private boolean checkZkAvailabled(){
+		try {
+			zkClient.exists(ZkConstant.ROOT_NODE);
+			zkAvailabled = true;
+		} catch (Exception e) {
+			zkAvailabled = false;
+			logger.warn("ZK server is not available....");
+		}
+		return zkAvailabled;
+	}
+	
+	private void execCommond(MonitorCommond cmd){
+		if(cmd == null)return;
+		
+		JobConfig config = schedulerConfgs.get(cmd.getJobName());
+		String key = String.format("%s:%s", cmd.getJobGroup(), cmd.getJobName());
+		final AbstractJob abstractJob = JobContext.getContext().getAllJobs().get(key);
+		if(MonitorCommond.TYPE_EXEC == cmd.getCmdType() || MonitorCommond.TYPE_DELETE_MOD == cmd.getCmdType()){
+			if(config.isRunning()){
+				logger.info("任务正在执行中，请稍后再执行");
+				return;
+			}
+			if (MonitorCommond.TYPE_DELETE_MOD == cmd.getCmdType()) {
+				abstractJob.deleteJob(config);
+				schedulerConfgs.remove(cmd.getJobName());
+				return;
+			}
+			if(abstractJob != null){
+				JobContext.getContext().submitSyncTask(new Runnable() {
+					@Override
+					public void run() {
+						try {
+							logger.info("begin execute job[{}] by MonitorCommond",abstractJob.getJobName());
+							abstractJob.doJob(JobContext.getContext());
+						} catch (Exception e) {
+							logger.error(abstractJob.getJobName(),e);
+						}
+					}
+				});
+			}else{
+				logger.warn("Not found job by key:{} !!!!",key);
+			}
+		}else if(MonitorCommond.TYPE_STATUS_MOD == cmd.getCmdType() 
+				|| MonitorCommond.TYPE_CRON_MOD == cmd.getCmdType()
+				|| MonitorCommond.TYPE_PARAM_MOD == cmd.getCmdType()){
+			
+			if(config != null){
+				if(MonitorCommond.TYPE_STATUS_MOD == cmd.getCmdType()){					
+					config.setActive("1".equals(cmd.getBody()));
+				}else if (MonitorCommond.TYPE_CRON_MOD == cmd.getCmdType()){
+					try {
+						new CronExpression(cmd.getBody().toString());
+					} catch (Exception e) {
+						throw new RuntimeException("cron表达式格式错误");
+					}
+					abstractJob.resetTriggerCronExpr(cmd.getBody().toString());
+					config.setCronExpr(cmd.getBody().toString());
+					
+				} else {
+					config.setExtraData(cmd.getBody().toString());
+				}
+				updateJobConfig(config);
+				if(JobContext.getContext().getConfigPersistHandler() != null){
+					JobContext.getContext().getConfigPersistHandler().persist(config);
+				}
+			}
+		}
+	}
+
+	@Override
+	public void updateJobConfig(JobConfig config) {
+		config.setModifyTime(Calendar.getInstance().getTimeInMillis());
+		zkClient.writeData(getPath(config), GfJsonUtil.toJSONString(config));
+		schedulerConfgs.put(config.getJobName(), config);
+	}
+
+	@Override
+	public void onRegistered() {
+		if (groupPath != null) {
+			logger.info("==============clear Invalid jobs=================");
+			List<String> jobs = zkClient.getChildren(groupPath);
+
+			List<String> registerJobs = new ArrayList<>(JobContext.getContext().getAllJobs().keySet());
+			String groupName = JobContext.getContext().getGroupName();
+			String jobPath;
+			for (String job : jobs) {
+				if ("nodes".equals(job)) {
+					continue;
+				}
+				if (registerJobs.contains(String.format("%s:%s", groupName, job))) {
+					continue;
+				}
+				jobPath = String.format("%s/%s", groupPath, job);
+				zkClient.delete(jobPath);
+			}
+			logger.info("==============clear Invalid jobs end=================");
+		}
+	}
+
+}

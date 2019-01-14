@@ -1,0 +1,15 @@
+########################################################
+###application info
+########################################################
+spring.application.name=jdd_schedule
+server.port=8899
+
+mysql.datasource.url=jdbc:log4jdbc:mysql://10.103.5.16:3306/wf_schedule?useUnicode=true&characterEncoding=UTF-8&useSSL=false
+mysql.datasource.username=root
+mysql.datasource.password=123456
+mysql.datasource.driver-class-name=net.sf.log4jdbc.DriverSpy
+
+zk.server=10.103.5.18:2181,10.103.5.23:2181,10.103.5.27:2181
+
+mp.url=http://mp.jdd.com/mp/public/authority/getMenusByParentMenuCodeAndLoginName.do
+cas.securityUrl=**/public/**,**/app/**,/health/**,/env/**,/metrics/**,/trace/**,/dump/**,/jolokia/**,/info/**,

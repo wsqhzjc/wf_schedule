@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<beans xmlns="http://www.springframework.org/schema/beans"
+	xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+	xsi:schemaLocation="http://www.springframework.org/schema/beans http://www.springframework.org/schema/beans/spring-beans.xsd">
+
+	<bean id="zkClient" class="com.wf.schedule.common.zk.ZkClientFactory" init-method="init">
+		<property name="connectionString" value="10.33.85.200:2181"/>
+	</bean>
+    <bean id="jobRegistry" class="com.wf.schedule.register.ZkJobRegistry">
+		<property name="zkClient" ref="zkClient"/>
+    </bean>
+
+	<bean id="schedulerFactoryBeanWrapper" class="com.wf.schedule.core.SchedulerFactoryBeanWrapper" >
+		<!-- 确保每个应用groupName唯一 -->
+		<property name="groupName" value="ticket_task" />
+		<property name="registry" ref="jobRegistry" />
+		<!--<property name="jobLogPersistHandler" ref="zkJobLogPersistHandler" />-->
+	</bean>
+
+</beans>
